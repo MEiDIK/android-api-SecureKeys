@@ -3,28 +3,18 @@
 //
 
 #include "configurations.h"
-#include "protocol.h"
-#include "crypto/base64.h"
+#include "extern_consts.h"
 #include <sys/system_properties.h>
 #include <unistd.h>
+#include <sstream>
 
-#define FIND(WHAT) find(crypto_wrapper.encode_key(WHAT), map)
+unsigned char Configurations::aes_iv[AES_IV_SIZE] = SECUREKEYS_AES_INITIAL_VECTOR;
+unsigned char Configurations::aes_key[AES_KEY_SIZE] = SECUREKEYS_AES_KEY;
 
-unsigned char Configurations::aes_iv[AES_IV_SIZE] = { 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
-                                                        0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
-unsigned char Configurations::aes_key[AES_KEY_SIZE] = { 0x60, 0x3d, 0xeb, 0x10, 0x15, 0xca, 0x71,
-                                             0xbe, 0x2b, 0x73, 0xae, 0xf0, 0x85, 0x7d, 0x77, 0x81, 0x1f, 0x35, 0x2c,
-                                             0x07, 0x3b, 0x61, 0x08, 0xd7, 0x2d, 0x98, 0x10, 0xa3, 0x09, 0x14, 0xdf,
-                                             0xf4 };
-
-/**
- * Find something in a map
- * @param what to find
- * @param where to look
- * @return string with the value found, or empty of nothing.
- */
-std::string find(std::string what, std::map<std::string, std::string> &where) {
-    return where[what];
+template < typename T > std::string to_string( const T& n ) {
+    std::ostringstream stm;
+    stm << n ;
+    return stm.str() ;
 }
 
 /**
@@ -75,14 +65,127 @@ bool check_cmdline_has_debug() {
 /**
  * Initialize the configurations. For more information see the class "SecureConfigurations" in the "annotation"
  * module
- * @param map
  */
-Configurations::Configurations(std::map<std::string, std::string> &map) : safe(true) {
-    configure_aes(map);
-    check_debug(map);
-    check_adb(map);
-    check_emulator(map);
-    check_secure_environment(map);
+Configurations::Configurations(JNIEnv *env, jobject &object_context) : safe(true) {
+    check_installer(env, object_context);
+    check_certificate(env, object_context);
+    check_debug();
+    check_adb();
+    check_emulator();
+    check_secure_environment();
+
+    if (!is_safe_to_use()) {
+        memset(aes_iv, 0, sizeof(aes_iv));
+        memset(aes_key, 0, sizeof(aes_key));
+    }
+}
+
+/**
+ * For detecting a valid signature we are using hashcodes.
+ */
+void Configurations::check_certificate(JNIEnv *env, jobject &object_context) {
+    std::string certificate(SECUREKEYS_SIGNING_CERTIFICATE);
+    if (!certificate.empty()) {
+        // Classes we will use
+        jclass class_context = env->FindClass("android/content/Context");
+        jclass class_package_manager = env->FindClass("android/content/pm/PackageManager");
+        jclass class_package_info = env->FindClass("android/content/pm/PackageInfo");
+        jclass class_signature = env->FindClass("android/content/pm/Signature");
+
+        // Get package manager
+        jmethodID method_get_package_manager = env->GetMethodID(class_context, "getPackageManager", "()Landroid/content/pm/PackageManager;");
+        jobject object_package_manager = env->CallObjectMethod(object_context, method_get_package_manager);
+
+        // Get packageName and GET_SIGNATURES params
+        jmethodID method_get_package_name = env->GetMethodID(class_context, "getPackageName", "()Ljava/lang/String;");
+        jobject object_package_name = env->CallObjectMethod(object_context, method_get_package_name);
+        jfieldID field_get_signatures = env->GetStaticFieldID(class_package_manager, "GET_SIGNATURES", "I");
+        jint object_get_signatures = env->GetStaticIntField(class_package_manager, field_get_signatures);
+
+        // Get package info with above params
+        jmethodID method_get_package_info = env->GetMethodID(class_package_manager, "getPackageInfo", "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;");
+        jobject object_package_info = env->CallObjectMethod(object_package_manager, method_get_package_info, object_package_name, object_get_signatures);
+        
+        // Get signatures field (Signature[])
+        jfieldID field_signatures = env->GetFieldID(class_package_info, "signatures", "[Landroid/content/pm/Signature;");
+        jobjectArray object_array_signatures = (jobjectArray) env->GetObjectField(object_package_info, field_signatures);
+        
+        // Clean the stack frame
+        env->DeleteLocalRef(object_package_manager);
+        env->DeleteLocalRef(object_package_name);
+        env->DeleteLocalRef(object_package_info);
+
+        bool aux_safe = false;
+        int signaturesLength = env->GetArrayLength(object_array_signatures);
+        for (int i = 0 ; i < signaturesLength ; i++) {
+            jobject object_signature = env->GetObjectArrayElement(object_array_signatures, i);
+
+            // Get hashcode method
+            jmethodID method_hash_code = env->GetMethodID(class_signature, "hashCode", "()I");
+            jint object_hash_code = env->CallIntMethod(object_signature, method_hash_code);
+            int hash_code = (int) object_hash_code;
+
+            if (to_string(hash_code) == certificate) {
+                aux_safe = true;
+            }
+
+            env->DeleteLocalRef(object_signature);
+        }
+
+        env->DeleteLocalRef(object_array_signatures);
+
+        if (!aux_safe) {
+            safe = false;
+        }
+    }
+}
+
+void Configurations::check_installer(JNIEnv *env, jobject &object_context) {
+    std::string installers[] = SECUREKEYS_INSTALLERS;
+
+    if (sizeof(installers)) {
+        // Find jclass we will interact with
+        jclass class_context = env->FindClass("android/content/Context");
+        jclass class_package_manager = env->FindClass("android/content/pm/PackageManager");
+
+        // Get the package manager jobject
+        jmethodID method_get_package_manager = env->GetMethodID(class_context, "getPackageManager", "()Landroid/content/pm/PackageManager;");
+        jobject object_package_manager = env->CallObjectMethod(object_context, method_get_package_manager);
+
+        // Get the methods for getting my package name and the installer package name
+        jmethodID method_get_installer_package_name = env->GetMethodID(class_package_manager, "getInstallerPackageName", "(Ljava/lang/String;)Ljava/lang/String;");
+        jmethodID method_get_package_name = env->GetMethodID(class_context, "getPackageName", "()Ljava/lang/String;");
+
+        // Obtain my package name
+        jobject object_package_name = env->CallObjectMethod(object_context, method_get_package_name);
+        // Obtain the installer package name
+        jobject object_installer_package_name = (jstring) env->CallObjectMethod(object_package_manager, method_get_installer_package_name, object_package_name);
+
+        // Delete used local references
+        env->DeleteLocalRef(object_package_manager);
+        env->DeleteLocalRef(object_package_name);
+
+        bool aux_safe = false;
+
+        if (object_installer_package_name) {
+            const char *raw_installer_package_name = env->GetStringUTFChars((jstring) object_installer_package_name, 0);
+            std::string installer_package_name(raw_installer_package_name);
+
+            for (int i = 0 ; i < sizeof(installers) / sizeof(installers[0]) ; ++i) {
+                std::string installer = installers[i];
+                if (installer_package_name.size() >= installer.size() && installer_package_name.substr(0, installer.size()) == installer) {
+                    aux_safe = true;
+                }
+            }
+
+            env->ReleaseStringUTFChars((jstring) object_installer_package_name, 0);
+            env->DeleteLocalRef(object_installer_package_name);
+        }
+
+        if (!aux_safe) {
+            safe = false;
+        }
+    }
 }
 
 /**
@@ -103,37 +206,6 @@ bool Configurations::is_safe_to_use() {
     return safe;
 }
 
-void Configurations::configure_aes(std::map<std::string, std::string> &map) {
-    // Get aes values
-    std::string map_aes_rnd_key = FIND(SECUREKEYS_AES_RANDOM_SEED);
-
-    if (!map_aes_rnd_key.empty()) {
-        // Create from random seed
-        unsigned char map_aes_seed[map_aes_rnd_key.length()];
-        memcpy((char*) map_aes_seed, map_aes_rnd_key.c_str(), sizeof(map_aes_seed));
-
-        for (int i = 0 ; i < AES_KEY_SIZE; ++i) {
-            if (i < AES_IV_SIZE) {
-                aes_iv[i] = map_aes_seed[i];
-            }
-            aes_key[i] = map_aes_seed[map_aes_rnd_key.length() - i - 1];
-        }
-    } else {
-        // Check if unique values are present, else use defaults
-        std::string map_aes_key = FIND(SECUREKEYS_AES_KEY);
-        std::string map_aes_iv = FIND(SECUREKEYS_AES_INITIAL_VECTOR);
-
-        if (!map_aes_key.empty()) {
-            std::string map_aes_key_b64 = base64_decode(map_aes_key);
-            memcpy((char*) aes_key, map_aes_key_b64.c_str(), sizeof(aes_key));
-        }
-        if (!map_aes_iv.empty()) {
-            std::string map_aes_iv_b64 = base64_decode(map_aes_iv);
-            memcpy((char*) aes_iv, map_aes_iv_b64.c_str(), sizeof(aes_iv));
-        }
-    }
-}
-
 /**
  * Validates system properties checking if the debug ones are present.
  * Relevant notes:
@@ -141,16 +213,13 @@ void Configurations::configure_aes(std::map<std::string, std::string> &map) {
  * - getprop in adb shell
  * - https://github.com/jacobsoo/AndroidSlides/blob/master/CanSecWest-2013/An%20Android%20Hacker's%20Journey-%20Challenges%20in%20Android%20Security%20Research.pptx
  * - Get inside adb shell and see files and props
- *
- * @param map
  */
-void Configurations::check_debug(std::map<std::string, std::string> &map) {
-    if (!FIND(SECUREKEYS_HALT_IF_DEBUGGABLE).empty()) {
+void Configurations::check_debug() {
+    if (SECUREKEYS_HALT_IF_DEBUGGABLE) {
         if (validate_property_contains("ro.debuggable", "1") ||
             validate_property_contains("ro.kernel.android.checkjni", "1") ||
             validate_property_contains("ro.build.fingerprint", "debug") ||
             validate_property_contains("ro.build.product", "generic") ||
-            validate_property_contains("init.svc.debuggerd", "running") ||
             validate_property_contains("ro.product.device", "generic") ||
             check_cmdline_has_debug()) {
             safe = false;
@@ -158,8 +227,8 @@ void Configurations::check_debug(std::map<std::string, std::string> &map) {
     }
 }
 
-void Configurations::check_emulator(std::map<std::string, std::string> &map) {
-    if (!FIND(SECUREKEYS_HALT_IF_EMULATOR).empty()) {
+void Configurations::check_emulator() {
+    if (SECUREKEYS_HALT_IF_EMULATOR) {
         if (validate_property_contains("ro.kernel.qemu", "1") ||
             validate_property_contains("ro.hardware", "goldfish") ||
             validate_property_contains("ro.hardware", "ranchu") ||
@@ -173,11 +242,10 @@ void Configurations::check_emulator(std::map<std::string, std::string> &map) {
     }
 }
 
-void Configurations::check_adb(std::map<std::string, std::string> &map) {
-    if (!FIND(SECUREKEYS_HALT_IF_ADB_ON).empty()) {
+void Configurations::check_adb() {
+    if (SECUREKEYS_HALT_IF_ADB_ON) {
         if (validate_property_contains("sys.usb.state", "adb") ||
             validate_property_contains("sys.usb.config", "adb") ||
-            validate_property_contains("ro.adb.secure", "1") ||
             validate_property_contains("qemu.adb.secure", "0") ||
             validate_property_contains("persist.adb.notify", "1") ||
             validate_property_contains("persist.sys.usb.config", "adb")) {
@@ -186,8 +254,8 @@ void Configurations::check_adb(std::map<std::string, std::string> &map) {
     }
 }
 
-void Configurations::check_secure_environment(std::map<std::string, std::string> &map) {
-    if (!FIND(SECUREKEYS_HALT_IF_PHONE_NOT_SECURE).empty()) {
+void Configurations::check_secure_environment() {
+    if (SECUREKEYS_HALT_IF_PHONE_NOT_SECURE) {
         if (validate_property_contains("ro.secure", "0") ||
             validate_property_contains("persist.service.adb.enable", "1")) {
             safe = false;

@@ -4,9 +4,15 @@ import android.support.v7.app.AppCompatActivity;
 import android.os.Bundle;
 import android.widget.TextView;
 import com.u.securekeys.SecureEnvironment;
+import com.u.securekeys.annotation.SecureConfigurations;
 import com.u.securekeys.annotation.SecureKey;
 import com.u.securekeys.annotation.SecureKeys;
 import junit.framework.Assert;
+import android.content.pm.PackageManager;
+import android.content.pm.PackageInfo;
+import android.content.pm.Signature;
+import android.util.Log;
+import java.lang.Exception;
 
 /**
  * For having configurations, we could add here:
@@ -25,6 +31,10 @@ import junit.framework.Assert;
     blockIfPhoneNotSecure = bool
  }
  */
+@SecureConfigurations(
+    useAesRandomly = true,
+    certificateSignature = "1501784074"
+)
 @SecureKeys({
     @SecureKey(key = "a", value = "e"),
     @SecureKey(key = "b", value = "f"),
@@ -34,10 +44,19 @@ import junit.framework.Assert;
     @SecureKey(key = "double_from_BuildConfig", value = BuildConfig.TESTING_VALUE_2)
 })
 public class MainActivity extends AppCompatActivity {
+
+    boolean initialized = false;
+
     @Override
     @SecureKey(key = "client-secret", value = "aD98E2GEk23TReYds9Zs9zdSdDBi23EAsdq29fXkpsDwp0W+h")
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        if (!initialized) {
+            SecureEnvironment.initialize(this);
+            initialized = true;
+        }
+
         setContentView(R.layout.activity_main);
 
         Assert.assertEquals("aD98E2GEk23TReYds9Zs9zdSdDBi23EAsdq29fXkpsDwp0W+h", SecureEnvironment.getString("client-secret"));

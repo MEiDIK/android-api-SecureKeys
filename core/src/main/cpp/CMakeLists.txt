@@ -20,10 +20,9 @@ add_library(secure-keys
 			crypto/sha256.h
 			crypto/crypto_wrapper.h
 			configurations.h
-			protocol.h)
+			extern_consts.h)
 
 # find_library(log-lib log)
-
 # target_link_libraries(secure-keys ${log-lib})
 
 set(CMAKE_CXX_FLAGS "-fPIC")

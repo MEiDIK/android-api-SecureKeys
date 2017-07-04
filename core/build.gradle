@@ -1,18 +1,5 @@
-android {
-    defaultConfig {
-        externalNativeBuild {
-            cmake {
-                cppFlags "-std=c++11 -fexceptions"
-            }
-        }
-    }
-
-    externalNativeBuild {
-        cmake {
-            path "src/main/cpp/CMakeLists.txt"
-        }
-    }
-}
+project.ext.nativeAarRepackage = true
+apply plugin: 'saantiaguilera.securekeys'
 
 dependencies {
     compile project(path:':annotation')

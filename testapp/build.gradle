@@ -1,4 +1,5 @@
 apply plugin: 'com.android.application'
+apply plugin: 'saantiaguilera.securekeys'
 
 android {
     compileSdkVersion project.targetApiLevel.toInteger()
@@ -34,14 +35,44 @@ android {
     }
 }
 
+/**
+ * This is so that we can use the :core module locally
+ * Since gradle when compiling local projects gets the
+ * sources from the bundle on his own and not the aar :(
+ */
+task copyCoreAar() {
+    fileTree("libs/").filter { it.isFile() }.files.each { file ->
+        file.delete()
+    }
+
+    def aarFileRelease = project.rootProject.subprojects.find { it.name == 'core' }.file('build/outputs/aar/core-release.aar')
+
+    if (aarFileRelease.exists()) {
+        project.copy {
+            from aarFileRelease.absolutePath
+            into 'libs/'
+        }
+    }
+}
+
+repositories {
+    flatDir {
+        dirs 'libs'
+    }
+}
+
 dependencies {
     compile support.appcompat
 
     // For using the published ones:
-//    compile me.core
-//    annotationProcessor me.processor
+    // compile me.core
+    // annotationProcessor me.processor
 
-    // For using the project ones:
-    compile project(path:':core')
-    annotationProcessor project(path:':processor')
+    if (project.file('libs/core-release.aar').exists()) {
+        compile (name: 'core-release', ext: 'aar')
+        compile project(path: ':annotation')
+        annotationProcessor project(path:':processor')
+    } else {
+        println "Please run first core:assembleRelease before using the testapp"
+    }
 }

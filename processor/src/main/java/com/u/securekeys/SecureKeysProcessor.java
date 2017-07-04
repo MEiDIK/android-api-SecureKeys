@@ -1,87 +1,118 @@
 package com.u.securekeys;
 
-import com.squareup.javapoet.JavaFile;
-import com.squareup.javapoet.MethodSpec;
-import com.squareup.javapoet.TypeSpec;
 import com.u.securekeys.annotation.SecureConfigurations;
 import com.u.securekeys.annotation.SecureKey;
 import com.u.securekeys.annotation.SecureKeys;
+import com.u.securekeys.internal.Configurations;
 import com.u.securekeys.internal.Encoder;
-import com.u.securekeys.internal.Protocol;
+import com.u.securekeys.internal.NativeHeaderBuilder;
+import java.io.File;
 import java.io.IOException;
-import java.lang.reflect.Method;
-import java.nio.ByteBuffer;
+import java.io.FileWriter;
 import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Random;
 import java.util.Set;
-import java.util.concurrent.ThreadLocalRandom;
 import javax.annotation.processing.AbstractProcessor;
 import javax.annotation.processing.RoundEnvironment;
 import javax.annotation.processing.SupportedAnnotationTypes;
 import javax.annotation.processing.SupportedSourceVersion;
 import javax.lang.model.SourceVersion;
 import javax.lang.model.element.Element;
-import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
+import javax.tools.Diagnostic;
 
 @SupportedAnnotationTypes({ SecureKey.CLASSPATH, SecureKeys.CLASSPATH, SecureConfigurations.CLASSPATH })
 @SupportedSourceVersion(SourceVersion.RELEASE_7)
 public class SecureKeysProcessor extends AbstractProcessor {
 
-    /**
-     * Remember that the SecureKeys.java inside core references this class!
-     */
-    private static final String CLASS_NAME = "SCCache";
-    private static final String CLASS_CLASSPATH = "android.util";
+    private static final String FILE_NAME = "consts";
+    private static final String FILE_FULL_NAME = "extern_consts.h";
 
-    private static final String MAP_VARIABLE_NAME = "_var";
+    private static final String FILE_PATH_BLOB = "build/secure-keys/include/main/cpp";
 
-    private static final int RANDOM_STRING_LENGTH_MIN = 30;
-    private static final int RANDOM_STRING_LENGTH_MAX = 60;
+    private NativeHeaderBuilder headerBuilder;
 
     private Encoder encoder;
 
+    private List<SecureKey> annotations;
+    private List<SecureConfigurations> configurations;
+
     @Override
     public boolean process(final Set<? extends TypeElement> set, final RoundEnvironment roundEnvironment) {
-        List<SecureKey> annotations = flattenElements(
-            roundEnvironment.getElementsAnnotatedWith(SecureKey.class),
-            roundEnvironment.getElementsAnnotatedWith(SecureKeys.class)
-        );
-        HashMap<String, String> resultMap = new HashMap<>();
-
-        MethodSpec.Builder retrieveMethodBuilder = MethodSpec.methodBuilder("getElements")
-            .addModifiers(Modifier.FINAL, Modifier.PUBLIC, Modifier.STATIC)
-            .returns(resultMap.getClass())
-            .addStatement("java.util.HashMap<String, String> $L = new java.util.HashMap<String,String>()", MAP_VARIABLE_NAME);
-
-        configure(roundEnvironment, retrieveMethodBuilder);
-
-        for (SecureKey annotation : annotations) {
-            String key = encoder.hash(annotation.key());
-            String value = encoder.encode(annotation.value());
-
-            addToMap(retrieveMethodBuilder, key, value);
+        // Initialize variables if they are null
+        if (annotations == null) {
+            annotations = new ArrayList<>();
         }
 
-        retrieveMethodBuilder.addStatement("return $L", MAP_VARIABLE_NAME);
+        if (configurations == null) {
+            configurations = new ArrayList<>();
+        }
 
-        TypeSpec createdClass = TypeSpec.classBuilder(CLASS_NAME)
-            .addModifiers(Modifier.FINAL)
-            .addMethod(retrieveMethodBuilder.build())
-            .build();
+        // Since the apt might make more than one pass, add them all without processing
+        annotations.addAll(flattenElements(
+            roundEnvironment.getElementsAnnotatedWith(SecureKey.class),
+            roundEnvironment.getElementsAnnotatedWith(SecureKeys.class)
+        ));
+        
+        Set<? extends Element> elements = roundEnvironment.getElementsAnnotatedWith(SecureConfigurations.class);
+        for (Element element : elements) {
+            configurations.add(element.getAnnotation(SecureConfigurations.class));
+        }
 
-        JavaFile javaFile = JavaFile.builder(CLASS_CLASSPATH, createdClass)
-            .build();
+        // Check if this will be the last processing pass
+        if (roundEnvironment.processingOver()) {
+            headerBuilder = new NativeHeaderBuilder(FILE_NAME);
+            headerBuilder.addImport("map");
+            headerBuilder.addImport("string");
 
-        try {
-            javaFile.writeTo(processingEnv.getFiler());
-        } catch (IOException e) { /* Silent. */ }
+            configure();
+            addConstants();
+
+            try {
+                // Look for the directory we should drop the file into.
+                List<File> files = findNativeFiles(new File("."));
+                if (!files.isEmpty()) {
+                    String path = files.get(0).getAbsolutePath();
+                    headerBuilder.writeTo(new FileWriter(path + File.separatorChar + FILE_FULL_NAME));
+                } else {
+                    processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING,
+                            "No native files found for generating the full shared object. Maybe the plugin is missing?");
+                }
+            } catch (IOException e) {
+                processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING,
+                        "Exception ocurred writing file: " + e.getMessage());
+            }
+        }
 
         return true;
+    }
+
+    public List<File> findNativeFiles(File root) {
+        List<File> resultList = new ArrayList<>();
+
+        File[] auxlist = root.listFiles();
+
+        if (auxlist != null) {
+            for (File file : auxlist) {
+                if (file.isDirectory()) {
+                    if (file.getAbsolutePath().contains(FILE_PATH_BLOB)) {
+                        resultList.add(file);
+                        return resultList;
+                    } else {
+                        resultList.addAll(findNativeFiles(file));
+
+                        // We only need 1 sample, so as soon as we find one return
+                        if (!resultList.isEmpty()) {
+                            return resultList;
+                        }
+                    }
+                }
+            }
+        }
+
+        return resultList;
     }
 
     private List<SecureKey> flattenElements(Set<? extends Element> secureKeyElements,
@@ -99,27 +130,58 @@ public class SecureKeysProcessor extends AbstractProcessor {
         return result;
     }
 
-    private void configure(final RoundEnvironment roundEnvironment, MethodSpec.Builder builder) {
-        Set<? extends Element> elements = roundEnvironment.getElementsAnnotatedWith(SecureConfigurations.class);
-        List<SecureConfigurations> configurations = new ArrayList<>();
+    private void addConstants() {
+        String mapVariable = "_map";
+        String defineValue;
+        if (annotations.isEmpty()) {
+            defineValue = ";";
+        } else {
+            defineValue = "\\\n";
+            for (int i = 0; i < annotations.size(); i++) {
+                SecureKey annotation = annotations.get(i);
 
-        for (Element element : elements) {
-            configurations.add(element.getAnnotation(SecureConfigurations.class));
+                String key = Encoder.hash(annotation.key());
+                String value = encoder.encode(annotation.value());
+
+                defineValue += ("    " + mapVariable + "[\"" + key + "\"] = \"" + value + "\";");
+                if (i != annotations.size() - 1) {
+                    defineValue += " \\\n";
+                }
+            }
         }
 
+        headerBuilder.addDefine("SECUREKEYS_LOAD_MAP(" + mapVariable + ")", defineValue);
+    }
+
+    private void configure() {
         if (configurations.size() > 1) {
-            throw new IllegalStateException("More than one SecureConfigurations found. Only one can be used.");
+            processingEnv.getMessager().printMessage(Diagnostic.Kind.ERROR, "More than one SecureConfigurations found. Only one should be used");
+            throw new IllegalStateException("More than one SecureConfigurations found. Only one should be used.");
         }
 
         try {
+            Configurations nativeConfigurations = new Configurations();
+
+            byte[] iv = (byte[]) SecureConfigurations.class.getDeclaredMethod("aesInitialVector").getDefaultValue();
+            byte[] key = (byte[]) SecureConfigurations.class.getDeclaredMethod("aesKey").getDefaultValue();
+
+            encoder = new Encoder(iv, key);
+
+            nativeConfigurations.setAesKey(key);
+            nativeConfigurations.setAesVector(iv);
+            nativeConfigurations.setHaltAdbOn((boolean) SecureConfigurations.class.getDeclaredMethod("blockIfADB").getDefaultValue());
+            nativeConfigurations.setHaltNotSecure((boolean) SecureConfigurations.class.getDeclaredMethod("blockIfPhoneNotSecure").getDefaultValue());
+            nativeConfigurations.setHaltDebuggable((boolean) SecureConfigurations.class.getDeclaredMethod("blockIfDebugging").getDefaultValue());
+            nativeConfigurations.setHaltEmulator((boolean) SecureConfigurations.class.getDeclaredMethod("blockIfEmulator").getDefaultValue());
+            nativeConfigurations.setCertificate((String) SecureConfigurations.class.getDeclaredMethod("certificateSignature").getDefaultValue());
+            nativeConfigurations.setInstallers((String[]) SecureConfigurations.class.getDeclaredMethod("allowedInstallers").getDefaultValue());
+
             if (!configurations.isEmpty()) {
                 SecureConfigurations config = configurations.get(0);
 
                 if (config.useAesRandomly()) {
                     String seedString = Encoder.hash(String.valueOf(System.nanoTime()));
                     byte[] seed = seedString.getBytes(Charset.forName("UTF-8"));
-                    byte[] iv = new byte[16];
-                    byte[] key = new byte[32];
 
                     // Create iv from start and key from end in reverse
                     for (int i = 0 ; i < 32 ; i++) {
@@ -131,74 +193,28 @@ public class SecureKeysProcessor extends AbstractProcessor {
 
                     encoder = new Encoder(iv, key);
 
-                    addToMap(builder, Encoder.hash(Protocol.AES_RANDOM_SEED), seedString);
+                    nativeConfigurations.setAesKey(key);
+                    nativeConfigurations.setAesVector(iv);
                 } else {
                     encoder = new Encoder(config.aesInitialVector(), config.aesKey());
 
-                    if (SecureConfigurations.class.getDeclaredMethod("aesKey").getDefaultValue() !=
-                            config.aesKey()) {
-                        addToMap(builder,
-                            Encoder.hash(Protocol.AES_KEY),
-                            Encoder.base64(config.aesKey()));
-                    }
-
-                    if (SecureConfigurations.class.getDeclaredMethod("aesInitialVector").getDefaultValue() !=
-                            config.aesInitialVector()) {
-                        addToMap(builder,
-                            Encoder.hash(Protocol.AES_INITIAL_VECTOR),
-                            Encoder.base64(config.aesInitialVector()));
-                    }
+                    nativeConfigurations.setAesKey(config.aesKey());
+                    nativeConfigurations.setAesVector(config.aesInitialVector());
                 }
 
-                if (config.blockIfADB()) {
-                    addToMap(builder,
-                        Encoder.hash(Protocol.HALT_IF_ADB_ON),
-                        getSaltString() + "==");
-                }
-
-                if (config.blockIfDebugging()) {
-                    addToMap(builder,
-                        Encoder.hash(Protocol.HALT_IF_DEBUGGABLE),
-                        getSaltString() + "==");
-                }
-
-                if (config.blockIfEmulator()) {
-                    addToMap(builder,
-                        Encoder.hash(Protocol.HALT_IF_EMULATOR),
-                        getSaltString() + "==");
-                }
-
-                if (config.blockIfPhoneNotSecure()) {
-                    addToMap(builder,
-                        Encoder.hash(Protocol.HALT_IF_PHONE_NOT_SECURE),
-                        getSaltString() + "==");
-                }
-
-            } else {
-                byte[] iv = (byte[]) SecureConfigurations.class.getDeclaredMethod("aesInitialVector").getDefaultValue();
-                byte[] key = (byte[]) SecureConfigurations.class.getDeclaredMethod("aesKey").getDefaultValue();
-                encoder = new Encoder(iv, key);
+                nativeConfigurations.setHaltAdbOn(config.blockIfADB());
+                nativeConfigurations.setHaltNotSecure(config.blockIfPhoneNotSecure());
+                nativeConfigurations.setHaltDebuggable(config.blockIfDebugging());
+                nativeConfigurations.setHaltEmulator(config.blockIfEmulator());
+                nativeConfigurations.setInstallers(config.allowedInstallers());
+                nativeConfigurations.setCertificate(config.certificateSignature());
             }
+
+            nativeConfigurations.writeTo(headerBuilder);
         } catch (Exception ex) {
+            processingEnv.getMessager().printMessage(Diagnostic.Kind.ERROR, "This shouldnt happen. Please fill a issue with the stacktrace");
             throw new RuntimeException("This shouldnt happen. Please fill a issue with the stacktrace :)", ex);
         }
-    }
-
-    private void addToMap(MethodSpec.Builder builder, String key, String value) {
-        builder.addStatement("$L.put($S, $S)", MAP_VARIABLE_NAME, key, value);
-    }
-
-    private String getSaltString() {
-        final int stringLength = ThreadLocalRandom.current().nextInt(RANDOM_STRING_LENGTH_MIN,
-            RANDOM_STRING_LENGTH_MAX + 1);
-
-        String saltChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz1234567890";
-        StringBuilder salt = new StringBuilder();
-        while (salt.length() < stringLength) {
-            int index = (int) (ThreadLocalRandom.current().nextFloat() * saltChars.length());
-            salt.append(saltChars.charAt(index));
-        }
-        return salt.toString();
     }
 
 }

@@ -10,6 +10,8 @@ CMakeCache.txt
 *.so
 *.dylib
 .DS_Store
+*build/
+*.aar
 /build
 /captures
 .externalNativeBuild

@@ -21,6 +21,7 @@ test:
     - ./gradlew annotation:build --console=plain
     - ./gradlew core:build --console=plain
     - ./gradlew processor:build --console=plain
+    - ./gradlew plugin:build --console=plain
     - ./gradlew testapp:build --console=plain
   post:
     - if [ -d testapp/build/outputs ]; then cp -r testapp/build/outputs $CIRCLE_ARTIFACTS; fi
